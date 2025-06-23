@@ -19,6 +19,7 @@
     "build": "tsc",
     "build:watch": "tsc --watch",
     "start": "node http-server.js",
+    "heroku-postbuild": "npm run build",
     "start:mcp": "node build/index.js",
     "start:http": "node http-server.js",
     "dev": "npm run build && npm run start",
