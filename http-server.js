@@ -21,7 +21,8 @@ const port = process.env.PORT || 3000;
 // Whitelist of allowed origins
 const allowedOrigins = [
     'https://claryfy-frontend.vercel.app',
-    'http://localhost:3001' // For local frontend development
+    'http://localhost:3001', // For local frontend development
+    'https://mozilla.github.io' // For PDF.js viewer
 ];
 
 const corsOptions = {
