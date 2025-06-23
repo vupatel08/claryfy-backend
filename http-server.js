@@ -18,7 +18,26 @@ dotenv.config();
 const app = express();
 const port = 3000;
 
-app.use(cors());
+// Whitelist of allowed origins
+const allowedOrigins = [
+    'https://claryfy-frontend.vercel.app',
+    'http://localhost:3001' // For local frontend development
+];
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    }
+};
+
+// Enable CORS with dynamic origin and pre-flight handling
+app.use(cors(corsOptions));
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
