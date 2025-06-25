@@ -27,7 +27,12 @@ const port = process.env.PORT || 3000;
 const allowedOrigins = [
     'https://claryfy-frontend.vercel.app',
     'http://localhost:3001', // For local frontend development
-    'https://mozilla.github.io' // For PDF.js viewer
+    'https://mozilla.github.io', // For PDF.js viewer
+    // New domain useclaryfy.com
+    'https://useclaryfy.com',
+    'http://useclaryfy.com',
+    'https://www.useclaryfy.com',
+    'http://www.useclaryfy.com'
 ];
 
 const corsOptions = {
