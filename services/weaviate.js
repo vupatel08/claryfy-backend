@@ -4,7 +4,7 @@
 
 import weaviate, { ApiKey } from 'weaviate-ts-client';
 import * as dotenv from 'dotenv';
-import { createWeaviateSchemas, searchQueries } from '../../weaviate-schema.js';
+import { createWeaviateSchemas, searchQueries } from '../weaviate-schema.js';
 
 dotenv.config();
 
