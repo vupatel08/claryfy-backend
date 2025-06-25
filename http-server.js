@@ -8,6 +8,11 @@ import { dirname } from 'path';
 import { CanvasClient } from './build/client.js';
 import * as dotenv from 'dotenv';
 import fetch from 'node-fetch';
+import { OpenAIChatService, OpenAIRAGService } from './services/openai.js';
+import { supabase, SupabaseUserService, SupabaseConversationService } from './services/supabase.js';
+import { weaviateClient, WeaviateManagementService } from './services/weaviate.js';
+import multer from 'multer';
+import fs from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -138,6 +143,26 @@ async function processBatchWithRetry(items, processor, batchSize = PERFORMANCE_C
 
     return allResults;
 }
+
+// Configure multer for temporary file storage
+const upload = multer({
+    dest: 'uploads/',
+    limits: {
+        fileSize: 100 * 1024 * 1024, // 100MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('audio/')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only audio files are allowed'), false);
+        }
+    },
+    filename: (req, file, cb) => {
+        // Ensure correct file extension for OpenAI
+        const ext = file.mimetype.includes('webm') ? '.webm' : '.wav';
+        cb(null, `recording-${Date.now()}${ext}`);
+    }
+});
 
 // Serve the main HTML page
 app.get('/', (req, res) => {
@@ -282,10 +307,75 @@ app.get('/api/courses/favorites', async (req, res) => {
     }
 });
 
+// Get Canvas user profile
+app.get('/api/profile', async (req, res) => {
+    // Check if token and domain are provided for authentication
+    const { token, domain } = req.query;
+
+    // If token and domain provided, try to authenticate first
+    if (token && domain && (!canvasClient || userToken !== token || userDomain !== domain)) {
+        try {
+            console.log('🔑 Auto-authenticating with Canvas for profile...');
+            const testClient = new CanvasClient(token, domain);
+            const health = await testClient.healthCheck();
+
+            if (health.status === 'ok') {
+                initializeClient(token, domain);
+                console.log('✅ Auto-authentication successful for profile');
+            } else {
+                return res.status(401).json({ error: 'Invalid Canvas credentials' });
+            }
+        } catch (error) {
+            console.error('Profile auto-authentication failed:', error);
+            return res.status(401).json({ error: 'Authentication failed: ' + error.message });
+        }
+    }
+
+    if (!canvasClient) {
+        return res.status(401).json({ error: 'Not authenticated. Please provide token and domain parameters.' });
+    }
+
+    try {
+        console.log('👤 Fetching Canvas user profile...');
+        const profile = await canvasClient.getUserProfile();
+
+        console.log('✅ Canvas profile fetched:', profile.name);
+        res.json(profile);
+    } catch (error) {
+        console.error('❌ Error fetching Canvas profile:', error.message);
+        res.status(500).json({
+            error: 'Failed to fetch Canvas profile',
+            details: error.message
+        });
+    }
+});
+
 // Get all dashboard data with optimized performance
 app.get('/api/dashboard', async (req, res) => {
+    // Check if token and domain are provided for auto-authentication
+    const { token, domain } = req.query;
+
+    // If token and domain provided, try to authenticate first
+    if (token && domain && (!canvasClient || userToken !== token || userDomain !== domain)) {
+        try {
+            console.log('🔑 Auto-authenticating with Canvas...');
+            const testClient = new CanvasClient(token, domain);
+            const health = await testClient.healthCheck();
+
+            if (health.status === 'ok') {
+                initializeClient(token, domain);
+                console.log('✅ Auto-authentication successful');
+            } else {
+                return res.status(401).json({ error: 'Invalid Canvas credentials' });
+            }
+        } catch (error) {
+            console.error('Auto-authentication failed:', error);
+            return res.status(401).json({ error: 'Authentication failed: ' + error.message });
+        }
+    }
+
     if (!canvasClient) {
-        return res.status(401).json({ error: 'Not authenticated' });
+        return res.status(401).json({ error: 'Not authenticated. Please provide token and domain parameters.' });
     }
 
     try {
@@ -524,8 +614,6 @@ async function getAllFilesOptimized(dashboardCards) {
     return allFiles;
 }
 
-
-
 // Logout
 app.post('/logout', (req, res) => {
     canvasClient = null;
@@ -540,6 +628,901 @@ app.post('/logout', (req, res) => {
         lastResetTime: Date.now()
     };
     res.json({ success: true, message: 'Logged out successfully' });
+});
+
+// Serve test files
+app.get('/test-canvas-files.html', (req, res) => {
+    res.sendFile(path.join(__dirname, 'test-canvas-files.html'));
+});
+
+app.get('/test-pdf.html', (req, res) => {
+    res.sendFile(path.join(__dirname, 'test-pdf.html'));
+});
+
+// Enhanced chat endpoint with Gemini query processing and Supabase history
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { message, userId, courseId, conversationId } = req.body;
+
+        if (!message || !userId) {
+            return res.status(400).json({ error: 'Message and userId are required' });
+        }
+
+        console.log('💬 Enhanced chat request from user', userId, ':', message);
+
+        // PHASE 4: Use enhanced RAG pipeline with Gemini + Supabase
+        console.log('🚀 Starting enhanced RAG pipeline...');
+
+        try {
+            // Use the enhanced OpenAI RAG service with Gemini and Supabase integration
+            const result = await OpenAIRAGService.handleChatMessage(
+                userId,
+                message,
+                courseId,
+                weaviateClient,
+                supabase,
+                conversationId
+            );
+
+            const { stream, conversationId: newConversationId, queryParams, searchSummary } = result;
+
+            // Set headers for streaming
+            res.setHeader('Content-Type', 'text/plain');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+
+            let fullResponse = '';
+
+            // Stream the response
+            for await (const chunk of stream) {
+                const content = chunk.choices[0]?.delta?.content;
+                if (content) {
+                    fullResponse += content;
+                    res.write(content);
+                }
+            }
+
+            // Save assistant response to Supabase conversation
+            if (fullResponse && newConversationId) {
+                try {
+                    const { ConversationService } = await import('./services/conversation.js');
+                    await ConversationService.addMessage(newConversationId, fullResponse, 'assistant', {
+                        queryParams: queryParams,
+                        searchSummary: searchSummary,
+                        responseLength: fullResponse.length
+                    });
+
+                    // Vectorize this conversation for future context
+                    try {
+                        const { WeaviateChatService } = await import('./services/weaviate.js');
+                        await WeaviateChatService.vectorizeConversation(
+                            userId,
+                            newConversationId,
+                            [
+                                { role: 'user', content: message },
+                                { role: 'assistant', content: fullResponse }
+                            ],
+                            courseId
+                        );
+                        console.log('✅ Vectorized conversation for future context');
+                    } catch (vectorError) {
+                        console.error('Error vectorizing conversation:', vectorError);
+                        // Don't fail the request if vectorization fails
+                    }
+                } catch (saveError) {
+                    console.error('Error saving assistant response:', saveError);
+                }
+            }
+
+            res.end();
+
+        } catch (ragError) {
+            console.error('Enhanced RAG pipeline error, using fallback:', ragError);
+
+            // Enhanced fallback with basic conversation tracking
+            try {
+                const { ConversationService } = await import('./services/conversation.js');
+                const fallbackTitle = ConversationService.generateTitle(message);
+                const fallbackConversation = conversationId
+                    ? { id: conversationId }
+                    : await ConversationService.getOrCreateConversation(userId, fallbackTitle, courseId);
+
+                await ConversationService.addMessage(fallbackConversation.id, message, 'user', {
+                    fallback: true,
+                    error: ragError.message
+                });
+
+                const fallbackMessages = [
+                    {
+                        role: 'system',
+                        content: 'You are Claryfy, a helpful AI assistant for Canvas LMS. Provide helpful responses about coursework and assignments.'
+                    },
+                    {
+                        role: 'user',
+                        content: message
+                    }
+                ];
+
+                const fallbackStream = await OpenAIChatService.generateStreamingChatResponse(fallbackMessages, {
+                    stream: true
+                });
+
+                // Set headers for streaming
+                res.setHeader('Content-Type', 'text/plain');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+
+                let fallbackResponse = '';
+
+                // Stream the fallback response
+                for await (const chunk of fallbackStream) {
+                    const content = chunk.choices[0]?.delta?.content;
+                    if (content) {
+                        fallbackResponse += content;
+                        res.write(content);
+                    }
+                }
+
+                // Save fallback response
+                if (fallbackResponse) {
+                    await ConversationService.addMessage(fallbackConversation.id, fallbackResponse, 'assistant', {
+                        fallback: true
+                    });
+                }
+
+                res.end();
+
+            } catch (fallbackError) {
+                console.error('Both enhanced and fallback chat failed:', fallbackError);
+                res.status(500).json({ error: 'All chat methods failed: ' + fallbackError.message });
+            }
+        }
+
+    } catch (error) {
+        console.error('Chat error:', error);
+        res.status(500).json({ error: 'Failed to process chat message: ' + error.message });
+    }
+});
+
+// Get chat history
+app.get('/api/chat/history/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { courseId } = req.query;
+
+        const conversations = await SupabaseConversationService.getUserConversations(userId, courseId);
+
+        res.json({ conversations });
+    } catch (error) {
+        console.error('Error fetching chat history:', error);
+        res.status(500).json({ error: 'Failed to fetch chat history' });
+    }
+});
+
+// Get conversation messages
+app.get('/api/chat/conversation/:conversationId', async (req, res) => {
+    try {
+        const { conversationId } = req.params;
+        const { userId } = req.query; // Get userId from query params
+
+        if (!userId) {
+            return res.status(400).json({ error: 'userId is required' });
+        }
+
+        const messages = await SupabaseConversationService.getConversationMessages(conversationId, userId);
+
+        res.json({ messages });
+    } catch (error) {
+        console.error('Error fetching conversation messages:', error);
+        res.status(500).json({ error: 'Failed to fetch conversation messages' });
+    }
+});
+
+// Create new conversation
+app.post('/api/chat/conversation', async (req, res) => {
+    try {
+        const { userId, courseId, title } = req.body;
+
+        if (!userId || !title) {
+            return res.status(400).json({ error: 'UserId and title are required' });
+        }
+
+        const conversation = await SupabaseConversationService.createConversation(userId, courseId, title);
+
+        res.json({ conversation });
+    } catch (error) {
+        console.error('Error creating conversation:', error);
+        res.status(500).json({ error: 'Failed to create conversation' });
+    }
+});
+
+// Simple chat endpoint that only uses OpenAI
+app.post('/api/chat/simple', async (req, res) => {
+    try {
+        const { message } = req.body;
+
+        if (!message) {
+            return res.status(400).json({ error: 'Message is required' });
+        }
+
+        // Create a simple message array with just the user's message
+        const messages = [
+            {
+                role: 'system',
+                content: 'You are a helpful AI assistant.'
+            },
+            {
+                role: 'user',
+                content: message
+            }
+        ];
+
+        // Get response from OpenAI
+        const response = await OpenAIChatService.generateChatResponse(messages);
+
+        // Format and send the response
+        res.json({
+            response: response.choices[0].message.content,
+            messageId: response.id
+        });
+
+    } catch (error) {
+        console.error('Error in chat:', error);
+        res.status(500).json({ error: 'Failed to get response from AI' });
+    }
+});
+
+// ==============================================
+// PHASE 4: WEAVIATE VECTOR DATABASE ENDPOINTS
+// ==============================================
+
+// Weaviate health check
+app.get('/api/weaviate/health', async (req, res) => {
+    try {
+        const health = await WeaviateManagementService.healthCheck();
+        res.json(health);
+    } catch (error) {
+        console.error('Weaviate health check error:', error);
+        res.status(500).json({ error: 'Weaviate health check failed' });
+    }
+});
+
+// Get Weaviate schema info
+app.get('/api/weaviate/schema', async (req, res) => {
+    try {
+        const schema = await WeaviateManagementService.getSchemaInfo();
+        res.json(schema);
+    } catch (error) {
+        console.error('Error getting Weaviate schema:', error);
+        res.status(500).json({ error: 'Failed to get schema info' });
+    }
+});
+
+// Vectorize Canvas data for a user
+app.post('/api/weaviate/vectorize/canvas', async (req, res) => {
+    try {
+        const { userId, canvasData } = req.body;
+
+        if (!userId || !canvasData) {
+            return res.status(400).json({ error: 'UserId and canvasData are required' });
+        }
+
+        // Import the Canvas vectorization service
+        const { WeaviateCanvasService } = await import('./services/weaviate.js');
+
+        const results = await WeaviateCanvasService.vectorizeAllCanvasData(userId, canvasData);
+
+        res.json({
+            success: true,
+            vectorized: results,
+            message: 'Canvas data vectorized successfully'
+        });
+
+    } catch (error) {
+        console.error('Error vectorizing Canvas data:', error);
+        res.status(500).json({ error: 'Failed to vectorize Canvas data: ' + error.message });
+    }
+});
+
+// Search Canvas content
+app.post('/api/weaviate/search/canvas', async (req, res) => {
+    try {
+        const { query, userId, courseId, limit = 5 } = req.body;
+
+        if (!query || !userId) {
+            return res.status(400).json({ error: 'Query and userId are required' });
+        }
+
+        // Import the search service
+        const { WeaviateSearchService } = await import('./services/weaviate.js');
+
+        const results = await WeaviateSearchService.searchCanvasContent(query, userId, courseId, limit);
+
+        res.json({
+            results,
+            query,
+            count: results.length
+        });
+
+    } catch (error) {
+        console.error('Error searching Canvas content:', error);
+        res.status(500).json({ error: 'Failed to search Canvas content: ' + error.message });
+    }
+});
+
+// Search all content (Canvas + chat history + recordings)
+app.post('/api/weaviate/search/all', async (req, res) => {
+    try {
+        const { query, userId, courseId } = req.body;
+
+        if (!query || !userId) {
+            return res.status(400).json({ error: 'Query and userId are required' });
+        }
+
+        // Import the search service
+        const { WeaviateSearchService } = await import('./services/weaviate.js');
+
+        const results = await WeaviateSearchService.searchAllContent(query, userId, courseId);
+
+        res.json({
+            results,
+            query,
+            breakdown: {
+                canvasContent: results.canvasContent?.length || 0,
+                chatHistory: results.chatHistory?.length || 0,
+                recordings: results.recordings?.length || 0
+            }
+        });
+
+    } catch (error) {
+        console.error('Error searching all content:', error);
+        res.status(500).json({ error: 'Failed to search all content: ' + error.message });
+    }
+});
+
+// Vectorize a conversation
+app.post('/api/weaviate/vectorize/conversation', async (req, res) => {
+    try {
+        const { userId, conversationId, messages, courseId } = req.body;
+
+        if (!userId || !conversationId || !messages) {
+            return res.status(400).json({ error: 'UserId, conversationId, and messages are required' });
+        }
+
+        // Import the chat service
+        const { WeaviateChatService } = await import('./services/weaviate.js');
+
+        const result = await WeaviateChatService.vectorizeConversation(userId, conversationId, messages, courseId);
+
+        res.json({
+            success: true,
+            vectorized: result,
+            message: 'Conversation vectorized successfully'
+        });
+
+    } catch (error) {
+        console.error('Error vectorizing conversation:', error);
+        res.status(500).json({ error: 'Failed to vectorize conversation: ' + error.message });
+    }
+});
+
+// Clear user's vector data
+app.delete('/api/weaviate/user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'UserId is required' });
+        }
+
+        // Import the Canvas service
+        const { WeaviateCanvasService } = await import('./services/weaviate.js');
+
+        const result = await WeaviateCanvasService.clearUserData(userId);
+
+        res.json({
+            success: true,
+            cleared: result,
+            message: 'User vector data cleared successfully'
+        });
+
+    } catch (error) {
+        console.error('Error clearing user data:', error);
+        res.status(500).json({ error: 'Failed to clear user data: ' + error.message });
+    }
+});
+
+// Data sync pipeline - automatically vectorize Canvas data after fetching
+app.post('/api/weaviate/sync/canvas', async (req, res) => {
+    try {
+        const { userId, token, domain } = req.body;
+
+        if (!userId || !token || !domain) {
+            return res.status(400).json({ error: 'UserId, token, and domain are required' });
+        }
+
+        console.log(`🔄 Starting Canvas data sync and vectorization for user ${userId}...`);
+
+        // Initialize Canvas client for this request
+        const tempClient = new CanvasClient(token, domain);
+
+        // Temporarily set the global client for the helper functions
+        const originalClient = canvasClient;
+        canvasClient = tempClient;
+
+        try {
+            // Fetch Canvas data
+            console.log('📡 Fetching Canvas data...');
+            const dashboardCards = await tempClient.getDashboardCards();
+
+            // Limit courses for better performance
+            const limitedCourses = dashboardCards.slice(0, PERFORMANCE_CONFIG.MAX_COURSES);
+
+            // Get all Canvas content
+            const [assignmentsResult, announcementsResult, filesResult] = await Promise.allSettled([
+                getAllAssignmentsOptimized(limitedCourses),
+                getAllAnnouncementsOptimized(limitedCourses),
+                getAllFilesOptimized(limitedCourses)
+            ]);
+
+            const canvasData = {
+                courses: limitedCourses,
+                assignments: assignmentsResult.status === 'fulfilled' ? assignmentsResult.value : [],
+                announcements: announcementsResult.status === 'fulfilled' ? announcementsResult.value : [],
+                files: filesResult.status === 'fulfilled' ? filesResult.value : []
+            };
+
+            console.log(`📊 Fetched Canvas data: ${canvasData.courses.length} courses, ${canvasData.assignments.length} assignments, ${canvasData.announcements.length} announcements, ${canvasData.files.length} files`);
+
+            // Vectorize the Canvas data
+            console.log('🔍 Vectorizing Canvas data...');
+            const { WeaviateCanvasService } = await import('./services/weaviate.js');
+            const vectorizationResults = await WeaviateCanvasService.vectorizeAllCanvasData(userId, canvasData);
+
+            res.json({
+                success: true,
+                canvasData: {
+                    courses: canvasData.courses.length,
+                    assignments: canvasData.assignments.length,
+                    announcements: canvasData.announcements.length,
+                    files: canvasData.files.length
+                },
+                vectorizationResults,
+                message: 'Canvas data synced and vectorized successfully'
+            });
+
+        } finally {
+            // Restore the original client
+            canvasClient = originalClient;
+        }
+
+    } catch (error) {
+        console.error('Error syncing Canvas data:', error);
+        res.status(500).json({ error: 'Failed to sync Canvas data: ' + error.message });
+    }
+});
+
+// Refresh button functionality - sync and vectorize latest Canvas data
+app.post('/api/refresh-canvas-data', async (req, res) => {
+    try {
+        const { userId, token, domain } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'UserId is required' });
+        }
+
+        // Use provided credentials or fall back to stored ones
+        const useToken = token || userToken;
+        const useDomain = domain || userDomain;
+
+        if (!useToken || !useDomain) {
+            return res.status(400).json({ error: 'Canvas credentials not available' });
+        }
+
+        console.log(`🔄 Refreshing Canvas data for user ${userId}...`);
+
+        // Sync data and vectorize in one call
+        const syncResponse = await fetch(`http://localhost:${port}/api/weaviate/sync/canvas`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                userId,
+                token: useToken,
+                domain: useDomain
+            })
+        });
+
+        if (!syncResponse.ok) {
+            throw new Error('Failed to sync Canvas data');
+        }
+
+        const syncResult = await syncResponse.json();
+
+        res.json({
+            success: true,
+            message: 'Canvas data refreshed and vectorized successfully',
+            data: syncResult
+        });
+
+    } catch (error) {
+        console.error('Error refreshing Canvas data:', error);
+        res.status(500).json({ error: 'Failed to refresh Canvas data: ' + error.message });
+    }
+});
+
+// Streaming chat endpoint that only uses OpenAI
+app.post('/api/chat/simple/stream', async (req, res) => {
+    try {
+        const { message } = req.body;
+
+        if (!message) {
+            return res.status(400).json({ error: 'Message is required' });
+        }
+
+        // Set headers for streaming
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        // Create a simple message array with just the user's message
+        const messages = [
+            {
+                role: 'system',
+                content: 'You are a helpful AI assistant.'
+            },
+            {
+                role: 'user',
+                content: message
+            }
+        ];
+
+        // Get streaming response from OpenAI
+        const stream = await OpenAIChatService.generateStreamingChatResponse(messages);
+
+        // Stream the response
+        for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+                res.write(`data: ${JSON.stringify({ content })}\n\n`);
+            }
+        }
+
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+
+    } catch (error) {
+        console.error('Error in streaming chat:', error);
+        res.write(`data: ${JSON.stringify({ error: 'Failed to get response from AI' })}\n\n`);
+        res.end();
+    }
+});
+
+// =============================================
+// RECORDING ENDPOINTS
+// =============================================
+
+// Get user recordings
+app.get('/api/recordings', async (req, res) => {
+    try {
+        const { userId, courseId } = req.query;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        console.log(`📚 Fetching recordings for user ${userId}${courseId ? ` in course ${courseId}` : ''}`);
+
+        const { SupabaseRecordingService } = await import('./services/supabase.js');
+        const recordings = await SupabaseRecordingService.getUserRecordings(userId, courseId || null);
+
+        console.log(`✅ Found ${recordings.length} recordings`);
+        res.json(recordings);
+    } catch (error) {
+        console.error('❌ Error fetching recordings:', error.message);
+        res.status(500).json({
+            error: 'Failed to fetch recordings',
+            details: error.message
+        });
+    }
+});
+
+// Get specific recording details
+app.get('/api/recordings/:recordingId', async (req, res) => {
+    try {
+        const { recordingId } = req.params;
+
+        console.log(`📄 Fetching recording details for ${recordingId}`);
+
+        const { SupabaseRecordingService } = await import('./services/supabase.js');
+        const recording = await SupabaseRecordingService.getRecording(recordingId);
+
+        if (!recording) {
+            return res.status(404).json({ error: 'Recording not found' });
+        }
+
+        console.log(`✅ Recording details fetched: ${recording.title}`);
+        res.json(recording);
+    } catch (error) {
+        console.error('❌ Error fetching recording details:', error.message);
+        res.status(500).json({
+            error: 'Failed to fetch recording details',
+            details: error.message
+        });
+    }
+});
+
+// Process audio recording
+app.post('/api/recordings/process', upload.single('audio'), async (req, res) => {
+    try {
+        const { userId, courseId, recordingId, title, duration } = req.body;
+        const audioFile = req.file;
+
+        if (!audioFile || !userId || !courseId || !recordingId) {
+            return res.status(400).json({
+                error: 'Missing required fields: audio file, userId, courseId, or recordingId'
+            });
+        }
+
+        console.log(`🎙️ Processing recording ${recordingId} for user ${userId}`);
+
+        // Import services
+        const { OpenAIAudioService } = await import('./services/openai.js');
+        const { SupabaseRecordingService, SupabaseStorageService } = await import('./services/supabase.js');
+        const { WeaviateRecordingService } = await import('./services/weaviate.js');
+
+        let tempFileWithExt = null; // Track temporary file for cleanup
+
+        try {
+            // 1. Upload audio to Supabase Storage temporarily
+            console.log('📤 Uploading audio to storage...');
+
+            const audioBlob = fs.readFileSync(audioFile.path);
+            const storageResult = await SupabaseStorageService.uploadAudioFile(
+                userId,
+                recordingId,
+                audioBlob
+            );
+
+            // 2. Transcribe audio with Whisper
+            console.log('🎧 Transcribing audio with Whisper...');
+
+            // Determine file extension based on mime type
+            const fileExtension = audioFile.mimetype?.includes('webm') ? '.webm' : '.wav';
+            tempFileWithExt = audioFile.path + fileExtension;
+
+            // Copy file with proper extension for OpenAI
+            fs.copyFileSync(audioFile.path, tempFileWithExt);
+
+            // Create file stream for OpenAI
+            const audioFileForWhisper = fs.createReadStream(tempFileWithExt);
+            audioFileForWhisper.path = tempFileWithExt;
+
+            console.log(`🎧 Transcribing ${audioFile.mimetype} file with extension ${fileExtension}...`);
+
+            const transcription = await OpenAIAudioService.transcribeAudio(audioFileForWhisper);
+
+            if (!transcription || transcription.length < 10) {
+                throw new Error('Transcription too short or empty');
+            }
+
+            // 3. Generate summary with OpenAI
+            console.log('📝 Generating summary with OpenAI...');
+
+            // Get course info for better context
+            let courseInfo = null;
+            try {
+                // For now, create a simple course info object
+                // In future, we could fetch from Canvas API if user token is available
+                courseInfo = {
+                    id: courseId,
+                    name: `Course ${courseId}`,
+                    code: `COURSE-${courseId}`
+                };
+                console.log('✅ Course info created for context');
+            } catch (error) {
+                console.warn('Could not create course info:', error.message);
+            }
+
+            const summary = await OpenAIAudioService.generateLectureSummary(transcription, courseInfo);
+
+            // 4. Update recording in Supabase
+            console.log('💾 Saving to database...');
+
+            const updatedRecording = await SupabaseRecordingService.updateRecording(recordingId, {
+                transcription: transcription,
+                summary: summary,
+                status: 'completed',
+                audio_url: await SupabaseStorageService.getAudioFileUrl(userId, recordingId)
+            });
+
+            // 5. Vectorize in Weaviate
+            console.log('🧠 Vectorizing content...');
+
+            try {
+                await WeaviateRecordingService.vectorizeRecording(
+                    userId,
+                    recordingId,
+                    title,
+                    summary,
+                    transcription,
+                    parseInt(courseId),
+                    parseInt(duration)
+                );
+                console.log('✅ Recording vectorized successfully');
+            } catch (vectorError) {
+                console.warn('⚠️ Vectorization failed but continuing:', vectorError.message);
+                // Don't fail the entire process if vectorization fails
+            }
+
+            // 6. Clean up temporary files
+            try {
+                fs.unlinkSync(audioFile.path);
+                if (tempFileWithExt && tempFileWithExt !== audioFile.path) {
+                    fs.unlinkSync(tempFileWithExt);
+                }
+                console.log('🗑️ Temporary files cleaned up');
+            } catch (cleanupError) {
+                console.warn('Warning: Could not delete temporary file:', cleanupError.message);
+            }
+
+            // 7. Delete audio from storage (keep only transcription and summary)
+            try {
+                await SupabaseStorageService.deleteAudioFile(userId, recordingId);
+                console.log('🗑️ Audio file deleted from storage');
+            } catch (deleteError) {
+                console.warn('Warning: Could not delete audio file from storage:', deleteError.message);
+            }
+
+            console.log('✅ Recording processing completed successfully');
+
+            res.json({
+                success: true,
+                recording: updatedRecording,
+                transcription: transcription,
+                summary: summary,
+                message: 'Recording processed successfully'
+            });
+
+        } catch (processingError) {
+            console.error('❌ Error processing recording:', processingError);
+
+            // Update recording status to failed
+            try {
+                await SupabaseRecordingService.updateRecording(recordingId, {
+                    status: 'failed',
+                    summary: `Processing failed: ${processingError.message}`
+                });
+            } catch (updateError) {
+                console.error('Error updating recording status:', updateError);
+            }
+
+            // Clean up temporary files
+            try {
+                if (audioFile && audioFile.path) {
+                    fs.unlinkSync(audioFile.path);
+                }
+                if (tempFileWithExt && tempFileWithExt !== audioFile.path) {
+                    fs.unlinkSync(tempFileWithExt);
+                }
+            } catch (cleanupError) {
+                console.warn('Could not clean up temporary file:', cleanupError);
+            }
+
+            throw processingError;
+        }
+
+    } catch (error) {
+        console.error('Error in recording processing endpoint:', error);
+        res.status(500).json({
+            error: 'Failed to process recording: ' + error.message,
+            details: error.message
+        });
+    }
+});
+
+// Get user recordings
+app.get('/api/recordings/user/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { courseId } = req.query;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'User ID is required' });
+        }
+
+        // Import service
+        const { SupabaseRecordingService } = await import('./services/supabase.js');
+
+        const recordings = await SupabaseRecordingService.getUserRecordings(
+            userId,
+            courseId ? parseInt(courseId) : null
+        );
+
+        res.json({
+            recordings,
+            count: recordings.length
+        });
+
+    } catch (error) {
+        console.error('Error fetching user recordings:', error);
+        res.status(500).json({ error: 'Failed to fetch recordings: ' + error.message });
+    }
+});
+
+// Get specific recording details
+app.get('/api/recordings/:recordingId', async (req, res) => {
+    try {
+        const { recordingId } = req.params;
+
+        if (!recordingId) {
+            return res.status(400).json({ error: 'Recording ID is required' });
+        }
+
+        // Import service
+        const { SupabaseRecordingService } = await import('./services/supabase.js');
+
+        const recording = await SupabaseRecordingService.getRecording(recordingId);
+
+        if (!recording) {
+            return res.status(404).json({ error: 'Recording not found' });
+        }
+
+        res.json(recording);
+
+    } catch (error) {
+        console.error('Error fetching recording:', error);
+        res.status(500).json({ error: 'Failed to fetch recording: ' + error.message });
+    }
+});
+
+// Delete recording
+app.delete('/api/recordings/:recordingId', async (req, res) => {
+    try {
+        const { recordingId } = req.params;
+        const { userId } = req.body;
+
+        if (!recordingId || !userId) {
+            return res.status(400).json({ error: 'Recording ID and User ID are required' });
+        }
+
+        // Import services
+        const { SupabaseRecordingService, SupabaseStorageService } = await import('./services/supabase.js');
+
+        // Get recording to verify ownership
+        const recording = await SupabaseRecordingService.getRecording(recordingId);
+
+        if (!recording) {
+            return res.status(404).json({ error: 'Recording not found' });
+        }
+
+        if (recording.user_id !== userId) {
+            return res.status(403).json({ error: 'Not authorized to delete this recording' });
+        }
+
+        // Delete from storage if exists
+        try {
+            await SupabaseStorageService.deleteAudioFile(userId, recordingId);
+        } catch (storageError) {
+            console.warn('Could not delete audio file from storage:', storageError.message);
+        }
+
+        // Delete from database
+        await SupabaseRecordingService.deleteRecording(recordingId);
+
+        // TODO: Delete from Weaviate vector database
+        // This would require implementing a delete method in WeaviateRecordingService
+
+        res.json({
+            success: true,
+            message: 'Recording deleted successfully'
+        });
+
+    } catch (error) {
+        console.error('Error deleting recording:', error);
+        res.status(500).json({ error: 'Failed to delete recording: ' + error.message });
+    }
 });
 
 // Start server
@@ -566,15 +1549,6 @@ process.on('SIGINT', async () => {
 process.on('SIGTERM', async () => {
     console.log('\n🔄 Gracefully shutting down...');
     process.exit(0);
-});
-
-// Serve test files
-app.get('/test-canvas-files.html', (req, res) => {
-    res.sendFile(path.join(__dirname, 'test-canvas-files.html'));
-});
-
-app.get('/test-pdf.html', (req, res) => {
-    res.sendFile(path.join(__dirname, 'test-pdf.html'));
 });
 
 startServer(); 
