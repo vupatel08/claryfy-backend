@@ -14,7 +14,8 @@ const weaviateApiKey = process.env.WEAVIATE_API_KEY;
 const openaiApiKey = process.env.OPENAI_API_KEY;
 
 if (!weaviateUrl || !weaviateApiKey) {
-    throw new Error('Missing Weaviate configuration. Please check WEAVIATE_URL and WEAVIATE_API_KEY environment variables.');
+    console.log('⚠️ Weaviate configuration missing. Vector search features will be disabled.');
+    console.log('   Set WEAVIATE_URL and WEAVIATE_API_KEY environment variables to enable vector search.');
 }
 
 export const weaviateClient = weaviate.client({
