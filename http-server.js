@@ -13,12 +13,30 @@ import { supabase, SupabaseUserService, SupabaseConversationService } from './se
 import { weaviateClient, WeaviateManagementService } from './services/weaviate.js';
 import multer from 'multer';
 import fs from 'fs';
+import weaviate from 'weaviate-client';
+import {QueryAgent} from 'weaviate-agents';
+// Load environment variables
+dotenv.config();
+
+
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const client = await weaviate.connectToWeaviateCloud(process.env.WEAVIATE_URL, {
+    authCredentials: new weaviate.ApiKey(process.env.WEAVIATE_API_KEY),
+    headers: {
+        "X-INFERENCE-PROVIDER-API-KEY": process.env.OPENAI_API_KEY,
+    }
+});
+const qa = new QueryAgent(client, {
+    collections: ['CanvasContent'], 
+    systemPrompt: `You are a helpful assistant that can answer questions about the user's Canvas content. 
+                     If some content is not available in any of the user's data, you can tell them "None of your course data seems to answer your question."
+                     If there are sources in the user data, answer their question using the sources and also give them a link to it, or the file name.`,
+});
 
-// Load environment variables
-dotenv.config();
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -653,138 +671,46 @@ app.post('/api/chat', async (req, res) => {
             return res.status(400).json({ error: 'Message and userId are required' });
         }
 
-        console.log('💬 Enhanced chat request from user', userId, ':', message);
+        // Use Weaviate Query Agent instead of custom RAG
+        const response = await qa.run(message);
 
-        // PHASE 4: Use enhanced RAG pipeline with Gemini + Supabase
-        console.log('🚀 Starting enhanced RAG pipeline...');
+        // You can format the response as needed for your frontend
+        res.json({
+            response: response.finalAnswer || response.response,
+            originalQuery: response.originalQuery,
+            searches: response.searches,
+            aggregations: response.aggregations,
+            missingInformation: response.missingInformation,
+        });
 
-        try {
-            // Use the enhanced OpenAI RAG service with Gemini and Supabase integration
-            const result = await OpenAIRAGService.handleChatMessage(
-                userId,
-                message,
-                courseId,
-                weaviateClient,
-                supabase,
-                conversationId
-            );
-
-            const { stream, conversationId: newConversationId, queryParams, searchSummary } = result;
-
-            // Set headers for streaming
-            res.setHeader('Content-Type', 'text/plain');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-
-            let fullResponse = '';
-
-            // Stream the response
-            for await (const chunk of stream) {
-                const content = chunk.choices[0]?.delta?.content;
-                if (content) {
-                    fullResponse += content;
-                    res.write(content);
-                }
-            }
-
-            // Save assistant response to Supabase conversation
-            if (fullResponse && newConversationId) {
-                try {
-                    const { ConversationService } = await import('./services/conversation.js');
-                    await ConversationService.addMessage(newConversationId, fullResponse, 'assistant', {
-                        queryParams: queryParams,
-                        searchSummary: searchSummary,
-                        responseLength: fullResponse.length
-                    });
-
-                    // Vectorize this conversation for future context
-                    try {
-                        const { WeaviateChatService } = await import('./services/weaviate.js');
-                        await WeaviateChatService.vectorizeConversation(
-                            userId,
-                            newConversationId,
-                            [
-                                { role: 'user', content: message },
-                                { role: 'assistant', content: fullResponse }
-                            ],
-                            courseId
-                        );
-                        console.log('✅ Vectorized conversation for future context');
-                    } catch (vectorError) {
-                        console.error('Error vectorizing conversation:', vectorError);
-                        // Don't fail the request if vectorization fails
-                    }
-                } catch (saveError) {
-                    console.error('Error saving assistant response:', saveError);
-                }
-            }
-
-            res.end();
-
-        } catch (ragError) {
-            console.error('Enhanced RAG pipeline error, using fallback:', ragError);
-
-            // Enhanced fallback with basic conversation tracking
+        // Save and vectorize in the background (non-blocking)
+        (async () => {
             try {
                 const { ConversationService } = await import('./services/conversation.js');
-                const fallbackTitle = ConversationService.generateTitle(message);
-                const fallbackConversation = conversationId
-                    ? { id: conversationId }
-                    : await ConversationService.getOrCreateConversation(userId, fallbackTitle, courseId);
-
-                await ConversationService.addMessage(fallbackConversation.id, message, 'user', {
-                    fallback: true,
-                    error: ragError.message
-                });
-
-                const fallbackMessages = [
-                    {
-                        role: 'system',
-                        content: 'You are Claryfy, a helpful AI assistant for Canvas LMS. Provide helpful responses about coursework and assignments.'
-                    },
-                    {
-                        role: 'user',
-                        content: message
-                    }
-                ];
-
-                const fallbackStream = await OpenAIChatService.generateStreamingChatResponse(fallbackMessages, {
-                    stream: true
-                });
-
-                // Set headers for streaming
-                res.setHeader('Content-Type', 'text/plain');
-                res.setHeader('Cache-Control', 'no-cache');
-                res.setHeader('Connection', 'keep-alive');
-
-                let fallbackResponse = '';
-
-                // Stream the fallback response
-                for await (const chunk of fallbackStream) {
-                    const content = chunk.choices[0]?.delta?.content;
-                    if (content) {
-                        fallbackResponse += content;
-                        res.write(content);
-                    }
+                let convId = conversationId;
+                if (!convId) {
+                    // Generate a title or use a default
+                    const title = message.slice(0, 40) || 'New Conversation';
+                    const conversation = await ConversationService.getOrCreateConversation(userId, title, courseId);
+                    convId = conversation.id;
                 }
-
-                // Save fallback response
-                if (fallbackResponse) {
-                    await ConversationService.addMessage(fallbackConversation.id, fallbackResponse, 'assistant', {
-                        fallback: true
-                    });
-                }
-
-                res.end();
-
-            } catch (fallbackError) {
-                console.error('Both enhanced and fallback chat failed:', fallbackError);
-                res.status(500).json({ error: 'All chat methods failed: ' + fallbackError.message });
+                await ConversationService.addMessage(convId, message, 'user');
+                await ConversationService.addMessage(convId, response.finalAnswer || response.response, 'assistant');
+                const allMessages = await ConversationService.getConversationMessages(convId, userId);
+                const { WeaviateChatService } = await import('./services/weaviate.js');
+                await WeaviateChatService.vectorizeConversation(
+                    userId,
+                    convId,
+                    allMessages,
+                    courseId
+                );
+            } catch (err) {
+                console.error('Error saving/vectorizing chat:', err);
             }
-        }
+        })();
 
     } catch (error) {
-        console.error('Chat error:', error);
+        console.error('Weaviate Query Agent error:', error);
         res.status(500).json({ error: 'Failed to process chat message: ' + error.message });
     }
 });

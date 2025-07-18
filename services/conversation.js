@@ -1,5 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
+import weaviate from 'weaviate-client';
+import { QueryAgent } from 'weaviate-agents';
 
 dotenv.config();
 
