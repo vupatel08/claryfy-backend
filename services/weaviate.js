@@ -5,6 +5,8 @@
 import weaviate, { ApiKey } from 'weaviate-ts-client';
 import * as dotenv from 'dotenv';
 import { createWeaviateSchemas, searchQueries } from '../weaviate-schema.js';
+import axios from 'axios';
+import pdfParse from 'pdf-parse';
 
 dotenv.config();
 
@@ -159,8 +161,25 @@ export class WeaviateCanvasService {
             console.log(`📁 Vectorizing ${files.length} files...`);
 
             // Prepare all file data in parallel
-            const fileData = files.map(file => {
-                const content = `${file.display_name} ${file.filename || ''} ${file.description || ''}`.trim();
+            const fileData = await Promise.all(files.map(async (file) => {
+                let content = `${file.display_name} ${file.filename || ''} ${file.description || ''}`.trim();
+
+                // If the file is a PDF, try to download and parse it
+                if (file.content_type === 'application/pdf' && file.url) {
+                    try {
+                        const response = await axios.get(file.url, { responseType: 'arraybuffer' });
+                        const pdfBuffer = Buffer.from(response.data);
+                        const pdfData = await pdfParse(pdfBuffer);
+                        if (pdfData.text) {
+                            content = pdfData.text.substring(0, 20000); // Limit to 20k chars for safety
+                        }
+                    } catch (err) {
+                        console.error(`Error parsing PDF for file ${file.display_name}:`, err.message);
+                    }
+                }
+
+                // Debug log: print first 200 chars of content
+                console.log(`File: ${file.display_name} | Content Preview:`, content.substring(0, 200));
 
                 return {
                     content: content,
@@ -177,7 +196,7 @@ export class WeaviateCanvasService {
                     },
                     createdAt: file.created_at
                 };
-            });
+            }));
 
             // Use batch operation for faster vectorization
             const results = await this.batchCreateObjects('CanvasContent', fileData);
