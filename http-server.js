@@ -972,6 +972,39 @@ app.get('/api/search/canvas', async (req, res) => {
     }
 });
 
+// Search recording summaries
+app.get('/api/search/recordings', async (req, res) => {
+    try {
+        const { query, userId, courseId, limit = 5 } = req.query;
+
+        if (!query || !userId) {
+            return res.status(400).json({ error: 'Query and userId are required' });
+        }
+
+        // Use Query Agent for search
+        const response = await qa.run(
+            query,
+            {
+                collections: [{
+                    name: 'RecordingSummary',
+                    viewProperties: ['summary', 'transcription', 'title', 'recordingId', 'duration', 'courseId', 'userId']
+                }],
+                context: {
+                    userId,
+                    courseId: courseId || null,
+                    limit: parseInt(limit)
+                }
+            }
+        );
+
+        res.json(response);
+
+    } catch (error) {
+        console.error('Error searching recording summaries:', error);
+        res.status(500).json({ error: 'Failed to search recording summaries' });
+    }
+});
+
 // Search all content types
 app.get('/api/search/all', async (req, res) => {
     try {
@@ -1064,6 +1097,32 @@ app.delete('/api/weaviate/user/:userId', async (req, res) => {
     } catch (error) {
         console.error('Error clearing user data:', error);
         res.status(500).json({ error: 'Failed to clear user data: ' + error.message });
+    }
+});
+
+// Clear user's recording summaries
+app.delete('/api/weaviate/recordings/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'UserId is required' });
+        }
+
+        // Import the recording service
+        const { WeaviateRecordingService } = await import('./services/weaviate.js');
+
+        const result = await WeaviateRecordingService.clearUserRecordings(userId);
+
+        res.json({
+            success: true,
+            cleared: result,
+            message: 'User recording summaries cleared successfully'
+        });
+
+    } catch (error) {
+        console.error('Error clearing recording summaries:', error);
+        res.status(500).json({ error: 'Failed to clear recording summaries: ' + error.message });
     }
 });
 

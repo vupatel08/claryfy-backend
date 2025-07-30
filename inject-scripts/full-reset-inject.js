@@ -1,6 +1,6 @@
 import weaviate from 'weaviate-ts-client';
-import { FileProcessingService } from './services/fileProcessing.js';
-import { CanvasClient } from './build/client.js';
+import { FileProcessingService } from '../services/fileProcessing.js';
+import { CanvasClient } from '../build/client.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -14,8 +14,8 @@ const weaviateClient = weaviate.client({
     },
 });
 
-const USER_ID = '297da102-dbde-47a2-bba8-f11dcb00e99e'; // your current user
-const CANVAS_TOKEN = '1133~zauQ4cJeDNPVJmxRKh2HMDxPCkzQLx8mExLCZRB6c897FaP3W9M7n2CX8MCRC64m';
+const USER_ID = "1cc19f36-7afa-4b0a-873c-a8c6f2870dbe"; // your current user
+const CANVAS_TOKEN = '1133~6TXrLJmtUk8AJ3LkhyeKJYMykZ4tr9Ux92UDe9tuTD97TDWT6ruFzucBRkvtGeWy';
 const CANVAS_DOMAIN = 'umd.instructure.com';
 
 async function fullResetAndInject() {
@@ -193,4 +193,4 @@ async function fullResetAndInject() {
     }
 }
 
-fullResetAndInject(); 
+fullResetAndInject();

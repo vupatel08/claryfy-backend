@@ -302,12 +302,14 @@ export class OpenAIAudioService {
     // Generate lecture summary from transcription
     static async generateLectureSummary(transcription, courseInfo = null) {
         try {
-            let prompt = `Please create a comprehensive summary of this lecture transcription. Include:
+            let prompt = `Create a concise summary of this lecture transcription. Focus only on the essential content:
 
-1. Main topics covered
-2. Key concepts and definitions
-3. Important points to remember
-4. Any assignments or deadlines mentioned
+- Main topics (if any)
+- Key concepts (if any)
+- Important points (if any)
+- Assignments/deadlines (if any)
+
+Keep it brief and to the point. If the content is minimal or unclear, provide a simple, direct summary.
 
 Transcription:
 ${transcription}`;
@@ -319,7 +321,7 @@ ${transcription}`;
             const messages = [
                 {
                     role: 'system',
-                    content: 'You are an expert at creating educational summaries from lecture transcriptions. Focus on extracting the most important educational content.'
+                    content: 'You are an expert at creating concise, direct summaries from lecture transcriptions. Avoid unnecessary elaboration and focus on the actual content. If the transcription is minimal or unclear, provide a brief, honest summary without adding assumptions.'
                 },
                 {
                     role: 'user',
@@ -328,8 +330,8 @@ ${transcription}`;
             ];
 
             const response = await OpenAIChatService.generateChatResponse(messages, {
-                max_tokens: 800,
-                temperature: 0.3
+                max_tokens: 400,
+                temperature: 0.2
             });
 
             return response.choices[0].message.content.trim();

@@ -447,5 +447,54 @@ export class WeaviateCanvasService {
     }
 }
 
+// =============================================
+// RECORDING VECTORIZATION SERVICE
+// =============================================
+
+export class WeaviateRecordingService {
+    static async vectorizeRecording(userId, recordingId, title, summary, transcription, courseId, duration) {
+        try {
+            console.log('🎙️ Vectorizing recording summary...');
+
+            const recordingData = {
+                summary: summary,
+                transcription: transcription,
+                title: title,
+                courseId: courseId,
+                userId: userId,
+                recordingId: recordingId,
+                duration: duration,
+                createdAt: new Date().toISOString()
+            };
+
+            // Add to Weaviate RecordingSummary collection
+            await weaviateClient.data
+                .creator()
+                .withClassName('RecordingSummary')
+                .withProperties(recordingData)
+                .do();
+
+            console.log(`✅ Recording summary vectorized successfully for recording ${recordingId}`);
+            return true;
+
+        } catch (error) {
+            console.error('Error vectorizing recording summary:', error);
+            throw error;
+        }
+    }
+
+    static async clearUserRecordings(userId) {
+        return WeaviateManagementService.clearUserData(userId, 'RecordingSummary');
+    }
+
+    static async getRecordingCount(userId) {
+        return WeaviateManagementService.getObjectCount('RecordingSummary', {
+            path: ['userId'],
+            operator: 'Equal',
+            valueString: userId
+        });
+    }
+}
+
 // Export the client for Query Agent initialization only
 export default weaviateClient; 
