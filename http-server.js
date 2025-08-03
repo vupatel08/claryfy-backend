@@ -221,6 +221,34 @@ const upload = multer({
     }
 });
 
+// Configure multer for file uploads with OCR support
+const uploadFile = multer({
+    dest: 'uploads/',
+    limits: {
+        fileSize: 50 * 1024 * 1024, // 50MB limit for files
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = [
+            'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/bmp', 'image/webp', 'image/tiff',
+            'application/pdf',
+            'text/plain',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ];
+        
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('File type not supported for OCR processing'), false);
+        }
+    },
+    filename: (req, file, cb) => {
+        const timestamp = Date.now();
+        const originalName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+        cb(null, `${timestamp}-${originalName}`);
+    }
+});
+
 // Serve the main HTML page
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, '../public/index.html'));
@@ -884,6 +912,233 @@ app.post('/api/chat/simple', async (req, res) => {
     } catch (error) {
         console.error('Error in chat:', error);
         res.status(500).json({ error: 'Failed to get response from AI' });
+    }
+});
+
+// File upload with OCR processing endpoint
+app.post('/api/chat/upload-file', uploadFile.single('file'), async (req, res) => {
+    try {
+        const { userId, courseId, query } = req.body;
+        const uploadedFile = req.file;
+
+        if (!uploadedFile) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        if (!userId) {
+            return res.status(400).json({ error: 'UserId is required' });
+        }
+
+        if (!query) {
+            return res.status(400).json({ error: 'Query is required' });
+        }
+
+        console.log('📁 Processing uploaded file:', uploadedFile.originalname);
+        console.log('📝 User query:', query);
+
+        let extractedText = '';
+        let ocrMetadata = {};
+
+        try {
+            // Import OCR service
+            const OCRProcessingService = (await import('./services/ocrProcessing.js')).default;
+            const fs = await import('fs');
+            
+            // Read the uploaded file
+            const fileBuffer = fs.readFileSync(uploadedFile.path);
+            
+            // Process file based on type
+            if (OCRProcessingService.isImageFile(uploadedFile.mimetype)) {
+                console.log('🔍 Processing image file with OCR...');
+                const ocrResult = await OCRProcessingService.processImage(fileBuffer);
+                extractedText = ocrResult.text;
+                ocrMetadata = {
+                    confidence: ocrResult.confidence,
+                    engine: 'tesseract',
+                    ...ocrResult.metadata
+                };
+                console.log(`✅ OCR completed with ${ocrResult.confidence}% confidence`);
+                
+            } else if (uploadedFile.mimetype === 'application/pdf') {
+                console.log('📄 Processing PDF file...');
+                // Use existing PDF processing service
+                const { FileProcessingService } = await import('./services/fileProcessing.js');
+                const tempUrl = uploadedFile.path; // Use local file path
+                
+                // Read file and create a temporary buffer approach
+                const tempFileContent = fs.readFileSync(uploadedFile.path);
+                
+                // For local files, we need to create a data URL or use pdfParse directly
+                const pdfParse = (await import('pdf-parse')).default;
+                const pdfResult = await pdfParse(tempFileContent);
+                
+                extractedText = pdfResult.text;
+                ocrMetadata = {
+                    pageCount: pdfResult.numpages,
+                    engine: 'pdf-parse'
+                };
+                console.log(`✅ PDF processed: ${pdfResult.numpages} pages, ${extractedText.length} characters`);
+                
+            } else if (uploadedFile.mimetype === 'text/plain') {
+                console.log('📝 Processing text file...');
+                extractedText = fs.readFileSync(uploadedFile.path, 'utf8');
+                ocrMetadata = { engine: 'text-direct' };
+                
+            } else {
+                throw new Error(`Unsupported file type: ${uploadedFile.mimetype}`);
+            }
+
+            // Clean up uploaded file
+            fs.unlinkSync(uploadedFile.path);
+
+        } catch (processingError) {
+            console.error('❌ File processing error:', processingError);
+            // Clean up file if it exists
+            try {
+                const fs = await import('fs');
+                if (fs.existsSync(uploadedFile.path)) {
+                    fs.unlinkSync(uploadedFile.path);
+                }
+            } catch (cleanup) {
+                console.error('Error cleaning up file:', cleanup);
+            }
+            
+            return res.status(500).json({ 
+                error: 'File processing failed', 
+                details: processingError.message 
+            });
+        }
+
+        // Combine the query with extracted text for context
+        const contextualQuery = `Based on the following document content, please answer this question: "${query}"
+
+Document content:
+${extractedText}
+
+Please provide a comprehensive answer based on the document content above.`;
+
+        console.log(`📄 Extracted ${extractedText.length} characters from file`);
+        console.log('🤖 Generating AI response with file context...');
+
+        // Get embedding for the combined query
+        const embedding = await OpenAIChatService.getEmbedding(query);
+
+        // Search for additional relevant content from user's Canvas data
+        let relevantContent = [];
+        try {
+            const searchQuery = await client.graphql
+                .get()
+                .withClassName('CanvasContent')
+                .withFields('content title type metadata { filename size url } courseId')
+                .withNearVector({
+                    vector: embedding
+                })
+                .withWhere({
+                    operator: courseId ? 'And' : 'Equal',
+                    ...(courseId ? {
+                        operands: [
+                            { path: ['userId'], operator: 'Equal', valueString: userId },
+                            { path: ['courseId'], operator: 'Equal', valueNumber: parseInt(courseId) }
+                        ]
+                    } : {
+                        path: ['userId'],
+                        operator: 'Equal',
+                        valueString: userId
+                    })
+                })
+                .withLimit(3) // Limit to 3 since we already have the uploaded file content
+                .do();
+
+            relevantContent = searchQuery.data?.Get?.CanvasContent || [];
+        } catch (searchError) {
+            console.warn('⚠️ Could not search additional content:', searchError);
+        }
+
+        // Build context from both uploaded file and relevant Canvas content
+        let context = `UPLOADED FILE CONTENT (${uploadedFile.originalname}):\n${extractedText}\n\n`;
+        
+        if (relevantContent.length > 0) {
+            context += "RELATED COURSE CONTENT:\n";
+            context += relevantContent.map(item => {
+                const source = item.metadata?.filename || item.title;
+                return `[${item.type.toUpperCase()}] ${source}:\n${item.content}`;
+            }).join('\n\n');
+        }
+
+        // Prepare messages for OpenAI
+        const messages = [
+            {
+                role: 'system',
+                content: `You are an intelligent educational assistant. The user has uploaded a file and asked a question about it. Use the file content as the primary source for your answer, and supplement with any relevant course materials if available.
+
+Always cite your sources and be specific about what information comes from the uploaded file versus other sources.`
+            },
+            {
+                role: 'user',
+                content: `File uploaded: ${uploadedFile.originalname}
+Question: ${query}
+
+Context:
+${context}`
+            }
+        ];
+
+        // Get response from OpenAI
+        const aiResponse = await OpenAIChatService.generateChatResponse(messages, {
+            stream: false,
+            temperature: 0.7,
+            max_tokens: 1500
+        });
+        
+        const responseText = aiResponse.choices[0].message.content;
+
+        console.log('✅ AI response generated successfully');
+
+        // Send response with file processing metadata
+        res.json({
+            success: true,
+            response: responseText,
+            fileProcessed: {
+                filename: uploadedFile.originalname,
+                type: uploadedFile.mimetype,
+                size: uploadedFile.size,
+                extractedTextLength: extractedText.length,
+                ...ocrMetadata
+            },
+            sources: [
+                {
+                    title: uploadedFile.originalname,
+                    type: 'uploaded_file',
+                    extractedText: extractedText.length > 0
+                },
+                ...relevantContent.map(item => ({
+                    title: item.metadata?.filename || item.title,
+                    type: item.type,
+                    courseId: item.courseId
+                }))
+            ]
+        });
+
+    } catch (error) {
+        console.error('❌ Error in file upload chat:', error);
+        
+        // Clean up file if upload failed
+        if (req.file && req.file.path) {
+            try {
+                const fs = await import('fs');
+                if (fs.existsSync(req.file.path)) {
+                    fs.unlinkSync(req.file.path);
+                }
+            } catch (cleanup) {
+                console.error('Error cleaning up file:', cleanup);
+            }
+        }
+        
+        res.status(500).json({
+            success: false,
+            error: 'Failed to process file and generate response',
+            details: error.message
+        });
     }
 });
 
